@@ -17,6 +17,7 @@ test_dir = os.path.abspath(dirname)
 sys.path.append(test_dir)
 
 import rm2svg
+import PyPDF2
 
 # try to add the rmscene repo
 VERSION_6_SUPPORT = False
@@ -34,8 +35,6 @@ default_values = {
     'debug': 0,
     'rootdir': None,
     'outdir': None,
-    'width': 1404,
-    'height': 1872,
     'command': None,
     'infile': None,
     'outfile': None,
@@ -93,12 +92,24 @@ def get_repo_info(rootdir, debug):
     cur_uuid_list = [rootnode.uuid]
     cur_node = [rootnode]
     prev_node = None
+
+    # define a file to be trashed if it *or its parent* is trashed
+    # this "extended" definition prevents an infinite loop due to
+    # files that are not trashed, but whose parent is trashed (in the unextended definition)
+    def trashed(uuid, metadata):
+        if metadata['parent'] == 'trash':
+            return True
+        for uuid2, metadata2 in node_list:
+            if uuid2 == metadata['parent']:
+                return trashed(uuid2, metadata2)
+        return False
+
     while node_list:
         new_cur_uuid_list = []
         new_cur_node = []
         new_node_list = []
         for uuid, metadata in node_list:
-            if metadata['parent'] == 'trash':
+            if trashed(uuid, metadata):
                 # ignore it
                 pass
             elif metadata['parent'] in cur_uuid_list:
@@ -196,7 +207,7 @@ def run(command, dry_run, **kwargs):
     return returncode, out, err
 
 
-def convert_file(infile, outfile, rootdir, width, height, debug):
+def convert_file(infile, outfile, rootdir, debug):
     # get uuid
     uuid = os.path.basename(infile).split('.')[0]
     if not rootdir:
@@ -216,33 +227,132 @@ def convert_file(infile, outfile, rootdir, width, height, debug):
     elif content['formatVersion'] == 2:
         page_uuid_list = [page['id'] for page in content['cPages']['pages'] if 'deleted' not in page]
 
-    for page_uuid in page_uuid_list:
-        # ensure the file exists
+    bg_pdf_path = os.path.join(rootdir, uuid + '.pdf')
+    bg = PyPDF2.PdfReader(bg_pdf_path) if os.path.exists(bg_pdf_path) else None
+
+    bg_fg = PyPDF2.PdfWriter()
+
+    for page_num, page_uuid in enumerate(page_uuid_list):
         page_path = os.path.join(rootdir, uuid, page_uuid + '.rm')
-        assert(os.path.exists(page_path))
-        pagerm = page_path
+
+        # determine whether page has foreground (FG) notes (like a "pure" RM notebook),
+        # a background (BG) document (like an annotated PDF file), or both
+        fg_page_exists = os.path.exists(page_path)
+        if content['formatVersion'] == 1:
+            bg_page_exists = os.path.exists(bg_pdf_path) and content['redirectionPageMap'][page_num] >= 0 # TODO: what is redirectionPageMap value for an unannotated page?
+        elif content['formatVersion'] == 2:
+            bg_page_exists = os.path.exists(bg_pdf_path) and 'redir' in content['cPages']['pages'][page_num]
+
+        # determine document size based on background (BG)
+        # if BG does not exist, default to 1404px x 1872px (RM screen size) = 157mm x 210mm (exported PDF)
+        # for unexported notes, and scale up with corresponding pixel density later if the notes are extended
+        # if BG exists, obtain BG document's physical size and convert it to RM pixels
+        px_per_mm_x = 1404 / (445 * 25.4 / 72) # for unextended standard notes
+        px_per_mm_y = 1872 / (594 * 25.4 / 72) # for unextended standard notes
+        if bg_page_exists:
+            if content['formatVersion'] == 1:
+                bg_page_num = content['redirectionPageMap'][page_num] # looks like this points to BG PDF page number
+            elif content['formatVersion'] == 2:
+                bg_page_num = content['cPages']['pages'][page_num]['redir']['value'] # looks like this points to BG PDF page number
+            bg_page = bg.pages[bg_page_num]
+            bg_width_mm = float(bg_page.mediabox.width) * 25.4 / 72 # mediaBox in user space units (1/72 inch)
+            bg_height_mm = float(bg_page.mediabox.height) * 25.4 / 72 # mediaBox in user space units (1/72 inch)
+            bg_width_px = bg_width_mm * px_per_mm_x
+            bg_height_px = bg_height_mm * px_per_mm_y
+        else:
+            bg_page = None
+            bg_width_px = 1404
+            bg_height_px = 1872
+            bg_width_mm = bg_width_px / px_per_mm_x
+            bg_height_mm = bg_height_px / px_per_mm_y
+
+        # convert foreground (FG) notes to .svg
         pagesvg = os.path.join(tmpdir, page_uuid + '.svg')
-        colored_annotations = True
-        try:
-            rm2svg.rm2svg(pagerm, pagesvg, colored_annotations, width, height)
-        except:
-            rm2svgv6.rm2svg(pagerm, pagesvg)
-        pagepdf = os.path.join(tmpdir, page_uuid + '.pdf')
-        command = 'inkscape %s --export-filename=%s' % (pagesvg, pagepdf)
-        returncode, out, err = run(command, False)
-        assert(returncode == 0), command
-        pagepdf_list.append(pagepdf)
-    # put all the pages together
-    command = 'pdfunite %s "%s"' % (' '.join(pagepdf_list), outfile)
-    returncode, out, err = run(command, False)
-    assert(returncode == 0), command
+        bg_dx_px = 0 # how much to shift background depends on extent of foreground notes
+        bg_dy_px = 0
+        if fg_page_exists:
+            pagerm = page_path
+
+            # determine version
+            with open(pagerm, 'rb') as file:
+                head_fmt = 'reMarkable .lines file, version=v'
+                head = file.read(len(head_fmt)).decode()
+                v = head[-1] if head[:-1] == head_fmt[:-1] else None
+
+            try:
+                if v in ('6'):
+                    # v6 renderer
+                    page_info = rm2svgv6.rm2svg(pagerm, pagesvg, minwidth=bg_width_px, minheight=bg_height_px)
+                    fg_width_px = page_info.width
+                    fg_height_px = page_info.height
+                    bg_dx_px = page_info.xpos_delta - bg_width_px/2 # see rmscene rm2svg.py: get_dimensions()
+                    bg_dy_px = page_info.ypos_delta
+                elif v in ('1', '2', '3', '4', '5'):
+                    # pre-v6 renderer
+                    rm2svg.rm2svg(pagerm, pagesvg, True, bg_width_px, bg_height_px)
+                    fg_width_px = bg_width_px
+                    fg_height_px = bg_height_px
+                else:
+                    raise 'Unknown reMarkable .lines version: {v}'
+
+                fg_width_mm = fg_width_px / px_per_mm_x
+                fg_height_mm = fg_height_px / px_per_mm_y
+
+                # convert FG from .svg to .pdf
+                # TODO: revert to inkscape, now that I'm using PyPDF2 to merge anyway (but need to handle width)?
+                pagepdf = os.path.join(tmpdir, page_uuid + '.pdf')
+                command = 'rsvg-convert --format=pdf --width=%fmm --height=%fmm "%s" > "%s"' % (fg_width_mm, fg_height_mm, pagesvg, pagepdf)
+                returncode, out, err = run(command, False)
+                assert(returncode == 0), command
+            except Exception as e:
+                print(f'WARNING: could not render foreground - skipping it! Exception:\n{str(e)}')
+                fg_page_exists = False # ensure no attempt is made to render it later
+
+        # if foreground does not exist (or it failed to render above),
+        # then pretend it has the same size as the background
+        if not fg_page_exists:
+            fg_width_px = bg_width_px
+            fg_height_px = bg_height_px
+            fg_width_mm = fg_width_px / px_per_mm_x
+            fg_height_mm = fg_height_px / px_per_mm_y
+
+        if debug > 0:
+            print(f'....', end='') # indent
+            print(f'page {page_num+1}/{len(page_uuid_list)}', end=', ') # page number
+            print('+'.join((['BG'] if bg_page_exists else []) + (['FG'] if fg_page_exists else [])), end=', ') # "BG" / "FG" / "BG+FG"
+            print(f'{fg_width_px:.1f}px x {fg_height_px:.1f}px = {fg_width_mm:.1f}mm x {fg_height_mm:.1f}mm.') # size
+
+        # TODO: can probably optimize rendering!
+
+        # 1) begin with blank page
+        bg_fg_page = PyPDF2.PageObject.create_blank_page(width=fg_width_mm * 72 / 25.4, height=fg_height_mm * 72 / 25.4)
+
+        # 2) draw background if it exists
+        if bg_page_exists:
+            bg_dx_mm = bg_dx_px / px_per_mm_x
+            bg_dy_mm = bg_dy_px / px_per_mm_y
+            trans = PyPDF2.Transformation().translate(tx=bg_dx_mm * 72 / 25.4, ty=bg_dy_mm * 72 / 25.4)
+            bg_fg_page.merge_page(bg_page)
+            bg_fg_page.add_transformation(trans)
+
+        # 3) draw foreground if it exists
+        if fg_page_exists:
+            fg_page = PyPDF2.PdfReader(pagepdf).pages[0]
+            bg_fg_page.merge_page(fg_page)
+
+        # 4) add page to PDF
+        bg_fg.add_page(bg_fg_page)
+
+    # finally, write PDF from memory to file
+    with open(outfile, "wb") as file:
+        bg_fg.write(file)
 
 
-def convert_all(rootdir, outdir, width, height, debug):
+def convert_all(rootdir, outdir, debug):
     rootnode = get_repo_info(rootdir, debug)
 
     # traverse the tree
-    def traverse_node(node, rootdir, outdir, width, height, debug):
+    def traverse_node(node, rootdir, outdir, debug):
         if node.uuid == '':
             # ignore the root node
             pass
@@ -273,12 +383,11 @@ def convert_all(rootdir, outdir, width, height, debug):
                 if do_convert:
                     if debug > 0:
                         print('..converting %s -> %s' % (infile, outfile))
-                    convert_file(infile, outfile, rootdir, width,
-                                 height, debug)
+                    convert_file(infile, outfile, rootdir, debug)
         for node in node.children:
-            traverse_node(node, rootdir, outdir, width, height, debug)
+            traverse_node(node, rootdir, outdir, debug)
 
-    traverse_node(rootnode, rootdir, outdir, width, height, debug)
+    traverse_node(rootnode, rootdir, outdir, debug)
 
 
 def get_options(argv):
@@ -314,16 +423,6 @@ def get_options(argv):
             dest='outdir', default=default_values['outdir'],
             metavar='OUTDIR',
             help='use OUTDIR as outdir directory',)
-    parser.add_argument(
-            '--width', action='store', type=int,
-            dest='width', default=default_values['width'],
-            metavar='WIDTH',
-            help=('use WIDTH width (default: %i)' % default_values['width']),)
-    parser.add_argument(
-            '--height', action='store', type=int,
-            dest='height', default=default_values['height'],
-            metavar='HEIGHT',
-            help=('HEIGHT height (default: %i)' % default_values['height']),)
     # add command
     parser.add_argument(
             'command', action='store', type=str,
@@ -359,11 +458,9 @@ def main(argv):
     if options.command == 'list':
         list_repo(options.rootdir, options.debug)
     elif options.command == 'convert':
-        convert_file(options.infile, options.outfile, options.rootdir,
-                     options.width, options.height, options.debug)
+        convert_file(options.infile, options.outfile, options.rootdir, options.debug)
     elif options.command == 'convert-all':
-        convert_all(options.rootdir, options.outdir, options.width,
-                    options.height, options.debug)
+        convert_all(options.rootdir, options.outdir, options.debug)
 
 
 if __name__ == '__main__':
